@@ -1,228 +1,260 @@
-# app.py
-"""
-Run with:
-    streamlit run app.py
-"""
-
-import os
-import json
-import joblib
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import joblib
+import json
+import plotly.express as px
 import plotly.graph_objects as go
-from fpdf import FPDF
+import utils 
+import sys # For clean error handling
 
-# Files saved by train_model.py
-MODEL_FILE = "model_rf.pkl"
-FEATURES_FILE = "model_features.json"
+# --- Configuration ---
+MODEL_FILENAME = "final_ev_consumption_model_xgb.pkl" 
+MAE_FILENAME = "model_mae_consumption.pkl" 
+SHAP_IMPORTANCE_FILE = "model_shap_importance.json" 
 
-# Multipliers and presets
-DRIVING_STYLE_MULT = {"Eco": 0.85, "Normal": 1.0, "Aggressive": 1.18}
-ROAD_TYPE_MULT = {"Highway": 0.90, "City": 1.15, "Mixed": 1.0}
+@st.cache_resource
+def load_resources():
+    """Load the model, config, MAE, and feature importance files."""
+    try:
+        model = joblib.load(MODEL_FILENAME)
+        config = utils.load_config() 
+        mae = joblib.load(MAE_FILENAME)
+        
+        with open(SHAP_IMPORTANCE_FILE, 'r') as f:
+            importance_data = json.load(f) 
+            
+        return model, config, mae, pd.DataFrame(importance_data)
+    except FileNotFoundError as e:
+        st.error(f"Error loading required files. Please run train_model.py first. Missing file: {e}")
+        return None, None, None, None
+    except Exception as e:
+        st.error(f"An error occurred during resource loading: {e}")
+        return None, None, None, None
 
-VEHICLES = {
-    "Tata Nexon EV (30.2 kWh)": 30.2,
-    "MG ZS EV (44.5 kWh)": 44.5,
-    "Hyundai Kona EV (39.2 kWh)": 39.2,
-    "Custom (enter kWh)": None,
-}
+def plot_gauge(value, max_value, title):
+    """Creates a Plotly Gauge Chart for Range."""
+    display_value = min(value, max_value)
+    
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        title={'text': title},
+        gauge={
+            'axis': {'range': [None, max_value], 'tickwidth': 1, 'tickcolor': "darkblue"},
+            'bar': {'color': "darkblue"},
+            'bgcolor': "white",
+            'borderwidth': 2,
+            'bordercolor': "gray",
+            'steps': [
+                {'range': [0, max_value * 0.15], 'color': 'red'},
+                {'range': [max_value * 0.15, max_value * 0.35], 'color': 'orange'},
+                {'range': [max_value * 0.35, max_value], 'color': 'lightgreen'}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': max_value * 0.15
+            }
+        }
+    ))
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
 
-# Validate model files
-if not os.path.exists(MODEL_FILE) or not os.path.exists(FEATURES_FILE):
-    st.error("Model files not found. Run train_model.py first.")
-    st.stop()
+def display_range_results(total_capacity, predicted_consumption, distance, battery_health, reserve_pct, mae):
+    """Calculates and displays all primary results."""
+    
+    remaining_range_km = utils.calculate_realistic_range(
+        total_capacity, predicted_consumption, distance, battery_health, reserve_pct
+    )
+    consumption_rate_kwh_per_km = predicted_consumption / distance
+    
+    total_theoretical_range = total_capacity / consumption_rate_kwh_per_km
+    
+    st.subheader("Final Range Prediction")
+    
+    col_gauge, col_metrics = st.columns([1.5, 2])
 
-model = joblib.load(MODEL_FILE)
-with open(FEATURES_FILE, "r") as f:
-    MODEL_FEATURES = json.load(f)
+    with col_gauge:
+        gauge_fig = plot_gauge(
+            remaining_range_km, 
+            total_theoretical_range, 
+            "Remaining Range (km)"
+        )
+        st.plotly_chart(gauge_fig, use_container_width=True)
 
-st.set_page_config(page_title="EV Smart Dashboard", layout="wide", page_icon="🔋")
-st.markdown("<h1 style='text-align:center;'>⚡ EV Smart Range Prediction — Final</h1>", unsafe_allow_html=True)
-st.write("## Vehicle & Scenario")
+    with col_metrics:
+        st.markdown("### Performance Metrics")
+        col_m1, col_m2 = st.columns(2)
+        
+        col_m1.metric(
+            label="Total Possible Range (km)", 
+            value=f"{total_theoretical_range:,.0f} km"
+        )
+        col_m2.metric(
+            label="Effective Battery Capacity", 
+            value=f"{total_capacity * (battery_health / 100.0):.1f} kWh"
+        )
+        
+        st.markdown("### Consumption & Error")
+        col_m3, col_m4 = st.columns(2)
+        
+        col_m3.metric(
+            label=f"Predicted Consumption / {distance} km", 
+            value=f"{predicted_consumption:.3f} KWh"
+        )
+        col_m4.metric(
+            label="Model MAE (Consumption Error)", 
+            value=f"±{mae:.4f} KWh",
+            delta_color="off"
+        )
+        
+    st.info(
+        f"The prediction incorporates **{battery_health}% Battery Health** and a **{reserve_pct}% Reserve** factor, leading to an estimated remaining range of **{remaining_range_km:,.0f} km**."
+    )
 
-# Sidebar: vehicle + scenario
-with st.sidebar:
-    st.header("Vehicle & Scenario")
-    vehicle_choice = st.selectbox("Select vehicle (or custom)", list(VEHICLES.keys()))
-    if VEHICLES[vehicle_choice] is None:
-        battery_capacity = st.number_input("Enter battery capacity (kWh)", min_value=1.0, value=30.2, step=0.1)
-    else:
-        battery_capacity = VEHICLES[vehicle_choice]
 
-    st.subheader("Behavior")
-    driving_style = st.selectbox("Driving style", ["Normal", "Eco", "Aggressive"])
-    road_type = st.selectbox("Road type", ["Mixed", "City", "Highway"])
+def display_shap_importance(importance_df):
+    """Displays the SHAP feature importance visualization."""
+    st.subheader("Model Explainability: Global SHAP Importance")
+    st.markdown("SHAP values show the average magnitude of impact each feature has on the prediction.")
+    
+    # Plotly visualization logic
+    fig = px.bar(
+        importance_df.head(10), 
+        x='SHAP_Importance', 
+        y='Feature', 
+        orientation='h',
+        title='Global Feature Importance (Mean Absolute SHAP)',
+        labels={'Feature': 'Feature Name', 'SHAP_Importance': 'Average Impact Magnitude'},
+        color='SHAP_Importance',
+        color_continuous_scale=px.colors.sequential.Teal
+    )
+    fig.update_layout(yaxis={'autorange': "reversed"}, coloraxis_showscale=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def main():
+    """Streamlit application main function."""
+    st.set_page_config(
+        page_title="⚡️ Professional EV Predictor",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    model, features_config, mae, importance_df = load_resources()
+    if model is None:
+        st.stop()
+
+    st.title("⚡️ EV Consumption & Range Predictor: Professional Dashboard")
+    st.markdown("XGBoost Model with SHAP Interpretability.")
+    
+    # --- Sidebar for Configuration and Vehicle Info ---
+    with st.sidebar:
+        st.header("⚙️ Vehicle & Reserve Configuration")
+        total_battery_capacity = st.number_input("Total Battery Capacity (kWh)", value=60.0, min_value=10.0, max_value=200.0, step=0.5, help="Total nominal energy storage capacity.")
+        battery_health_pct = st.slider("Battery Health (%)", value=90, min_value=50, max_value=100, step=1, help="Current state of battery degradation.")
+        reserve_pct = st.slider("Range Reserve (%)", value=5, min_value=0, max_value=20, step=1, help="Percentage of total range reserved for safety.")
+        st.markdown("---")
+        st.caption("Model Version: XGBoost 1.5.0")
+
+
+    # --- Main Tabs ---
+    tab_input, tab_analysis = st.tabs(["1️⃣ Input & Predict Range", "2️⃣ Model Analysis & SHAP"])
+
+    with tab_input:
+        st.subheader("Input Driving & Environmental Factors")
+        
+        # Define Input Columns
+        col_driving, col_environmental, col_trip = st.columns(3)
+
+        with col_driving:
+            st.markdown("##### 🚗 Driving & Weight")
+            speed = st.number_input("Average Speed (km/h)", value=70.0, min_value=0.0, max_value=150.0, step=1.0)
+            vehicle_weight = st.number_input("Vehicle Weight (kg)", value=1800.0, min_value=500.0, max_value=4000.0, step=10.0)
+            road_type = st.selectbox("Road Type", options=["1", "2", "3", "4"])
+        
+        with col_environmental:
+            st.markdown("##### 🌡️ Environment & Power")
+            ambient_temp = st.slider("Ambient Temperature (°C)", value=20, min_value=-20, max_value=45, step=1)
+            battery_vol = st.number_input("Battery Voltage (Vol)", value=390.0, min_value=200.0, max_value=800.0, step=10.0)
+        
+        with col_trip:
+            st.markdown("##### ⛰️ Trip Factors")
+            slope = st.number_input("Slope (%)", value=2.0, min_value=-10.0, max_value=10.0, step=0.1)
+            distance = st.number_input("Distance Sample (km)", value=10.0, min_value=1.0, max_value=100.0, step=1.0)
+            
+        st.markdown("---")
+        
+        # --- Prediction Button ---
+        if st.button("Calculate Estimated Range 🚀", type="primary"):
+            
+            # --- PROFESSIONAL VALIDATION CHECK ---
+            if distance <= 0:
+                st.error("Error: Distance must be a positive value to calculate consumption rate.")
+                st.stop()
+            if vehicle_weight <= 0:
+                st.error("Error: Vehicle weight must be a positive value.")
+                st.stop()
+            # -------------------------------------
+
+            # 1. Input Data Collection 
+            input_data = {
+                "speed_kmh": speed, "weather_c": ambient_temp, "battery_vol": battery_vol,
+                "vehicle_we": vehicle_weight, "slope_%": slope, "road_type": road_type
+            }
+            
+            input_df = pd.DataFrame([input_data])
+            
+            # 2. Apply Feature Engineering
+            input_df_engineered = utils.feature_engineer(input_df)
+
+            # 3. Select all necessary columns (Base + Engineered)
+            all_input_cols = (
+                features_config['numerical_features'] + 
+                features_config['categorical_features'] +
+                features_config['new_engineered_features'] 
+            )
+            X_input = input_df_engineered[all_input_cols]
+
+            # 4. Prediction
+            try:
+                predicted_consumption = model.predict(X_input)[0]
+                predicted_consumption = max(0.001, predicted_consumption) 
+                
+                # 5. Store results in session state and switch to analysis tab
+                st.session_state['show_results'] = True
+                st.session_state['predicted_consumption'] = predicted_consumption
+                st.session_state['input_distance'] = distance
+                st.session_state['total_capacity'] = total_battery_capacity
+                st.session_state['battery_health'] = battery_health_pct
+                st.session_state['reserve_pct'] = reserve_pct
+                # Corrected command for Streamlit
+                st.rerun() 
+
+            except Exception as e:
+                st.error(f"Prediction failed. Error: {e}")
+                sys.stderr.write(f"Prediction error occurred: {e}\n") # Log the error
+
+    # --- Analysis Tab ---
+    with tab_analysis:
+        if 'show_results' in st.session_state and st.session_state['show_results']:
+            # Display primary metrics
+            display_range_results(
+                st.session_state['total_capacity'],
+                st.session_state['predicted_consumption'],
+                st.session_state['input_distance'],
+                st.session_state['battery_health'],
+                st.session_state['reserve_pct'],
+                mae
+            )
+            st.markdown("---")
+            # Display SHAP importance
+            display_shap_importance(importance_df)
+        else:
+            st.info("👈 Please enter your parameters in the 'Input & Predict Range' tab and click 'Calculate' to view the analysis.")
+
     st.markdown("---")
-    st.write("Model files:")
-    st.write(f"- `{MODEL_FILE}`")
-    st.write(f"- `{FEATURES_FILE}`")
+    st.caption("© 2025 EV Range Prediction Project. Model trained using Scikit-learn and XGBoost.")
 
-st.markdown("### Inputs")
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    speed = st.slider("Vehicle Speed (km/h)", 0, 140, 60)
-with col2:
-    acceleration = st.slider("Acceleration (m/s²)", -3.0, 5.0, 0.5, step=0.1)
-with col3:
-    soc = st.slider("Battery State of Charge (%)", 1, 100, 80)
-with col4:
-    temp = st.slider("Ambient Temperature (°C)", -10, 45, 25)
-
-col5, col6 = st.columns(2)
-with col5:
-    slope = st.number_input("Road slope (%)", value=0.0, step=0.1)
-with col6:
-    weight = st.number_input("Vehicle weight (kg)", value=1500, step=10)
-
-st.markdown("---")
-
-# Build feature vector consistent with model features
-def build_input_row():
-    # base numeric map (use reasonable defaults for missing fields)
-    numeric = {
-        "Speed_kmh": speed,
-        "Acceleration_ms2": acceleration,
-        "Battery_State_%": soc,
-        "Battery_Voltage_V": 0.0,
-        "Battery_Temperature_C": 0.0,
-        "Slope_%": slope,
-        "Temperature_C": temp,
-        "Humidity_%": 0.0,
-        "Wind_Speed_ms": 0.0,
-        "Tire_Pressure_psi": 0.0,
-        "Vehicle_Weight_kg": weight,
-    }
-    # categorical dummies: set zeros then set driving/road if present
-    cat_cols = {}
-    for feat in MODEL_FEATURES:
-        if feat.startswith("Driving_Mode_") or feat.startswith("Road_Type_") or feat.startswith("Traffic_Condition_") or feat.startswith("Weather_Condition_"):
-            cat_cols[feat] = 0
-
-    # set driving style column name if present
-    dm = f"Driving_Mode_{driving_style}"
-    if dm in cat_cols:
-        cat_cols[dm] = 1
-    rt = f"Road_Type_{road_type}"
-    if rt in cat_cols:
-        cat_cols[rt] = 1
-
-    # combine numeric + categorical into a row aligned to MODEL_FEATURES
-    row = {}
-    row.update(numeric)
-    row.update(cat_cols)
-    # ensure all MODEL_FEATURES exist; fill zeros for missing
-    for f in MODEL_FEATURES:
-        row.setdefault(f, 0.0)
-    # create DataFrame with ordered columns
-    df_row = pd.DataFrame([row], columns=MODEL_FEATURES)
-    df_row = df_row.fillna(0.0)
-    return df_row
-
-input_df = build_input_row()
-
-# Predict consumption kWh per 100 km
-pred_kwh_per_100km = float(model.predict(input_df.values)[0])
-
-# Apply multipliers (driving style & road type) and environmental adjustments
-style_mult = DRIVING_STYLE_MULT.get(driving_style, 1.0)
-road_mult = ROAD_TYPE_MULT.get(road_type, 1.0)
-
-# temperature effect
-temp_mult = 1.0
-if temp < 5:
-    temp_mult += 0.25  # cold penalty
-elif temp > 35:
-    temp_mult += 0.10  # hot penalty
-
-# slope penalty
-slope_mult = 1.0
-if slope > 4:
-    slope_mult += 0.12
-
-# speed penalty for very high speeds
-speed_mult = 1.0
-if speed > 120:
-    speed_mult += 0.20
-elif speed > 90:
-    speed_mult += 0.08
-
-adjusted_consumption = pred_kwh_per_100km * style_mult * road_mult * temp_mult * slope_mult * speed_mult
-
-# convert to kWh per km
-consumption_kwh_per_km = adjusted_consumption / 100.0
-eff_km_per_kwh = (1.0 / consumption_kwh_per_km) if consumption_kwh_per_km > 0 else 0.0
-
-full_range_km = battery_capacity / consumption_kwh_per_km if consumption_kwh_per_km > 0 else 0.0
-usable_range_km = full_range_km * (soc / 100.0)
-
-# Show metrics
-st.markdown("## 🔋 Range & Efficiency")
-c1, c2, c3 = st.columns(3)
-c1.metric("Predicted consumption (kWh/100km)", f"{pred_kwh_per_100km:.2f}")
-c2.metric("Adjusted consumption (kWh/100km)", f"{adjusted_consumption:.2f}")
-c3.metric("Efficiency (km/kWh)", f"{eff_km_per_kwh:.2f}")
-
-# Gauge
-g = go.Figure(go.Indicator(
-    mode="gauge+number",
-    value=usable_range_km,
-    title={'text': "Estimated Usable Range (km)"},
-    gauge={'axis': {'range': [0, max(200, battery_capacity*8)]},
-           'bar': {'color': "green" if usable_range_km > 100 else "orange" if usable_range_km>30 else "red"}}
-))
-st.plotly_chart(g, use_container_width=True)
-
-st.markdown("### Details")
-st.write(f"- Vehicle chosen: **{vehicle_choice}** (battery = {battery_capacity:.1f} kWh)")
-st.write(f"- Driving style multiplier: **{style_mult:.2f}** ; Road type multiplier: **{road_mult:.2f}**")
-st.write(f"- Environmental multipliers: temp {temp_mult:.2f}, slope {slope_mult:.2f}, speed {speed_mult:.2f}")
-st.write(f"- Full battery range (100%): **{full_range_km:.1f} km**")
-st.write(f"- Estimated usable range ({soc}%): **{usable_range_km:.1f} km**")
-
-# Recommendations
-st.markdown("### 🧭 Recommendations")
-recs = []
-if driving_style == "Aggressive":
-    recs.append("Aggressive driving increases consumption. Smooth acceleration and maintain steady speed to save energy.")
-if speed > 100:
-    recs.append("High speed increases aerodynamic losses. Reduce speed to increase range.")
-if temp < 5:
-    recs.append("Cold conditions reduce battery efficiency — precondition cabin when plugged in to improve range.")
-if soc < 20:
-    recs.append("Battery low (<20%). Plan a charge stop soon.")
-if slope > 4:
-    recs.append("Significant uphill slope detected — expect higher consumption.")
-if not recs:
-    recs.append("Conditions look normal. Use eco driving to maximize range.")
-
-for r in recs:
-    st.info(r)
-
-# PDF report creation
-def create_pdf(filename="EV_range_report.pdf"):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 10, "EV Range Prediction Report", ln=True, align="C")
-    pdf.ln(6)
-    pdf.cell(0, 8, f"Vehicle: {vehicle_choice} (battery {battery_capacity:.1f} kWh)", ln=True)
-    pdf.cell(0, 8, f"Speed: {speed} km/h, Accel: {acceleration} m/s^2, Temp: {temp} °C, SOC: {soc}%", ln=True)
-    pdf.cell(0, 8, f"Predicted consumption (kWh/100km): {pred_kwh_per_100km:.3f}", ln=True)
-    pdf.cell(0, 8, f"Adjusted consumption (kWh/100km): {adjusted_consumption:.3f}", ln=True)
-    pdf.cell(0, 8, f"Full range (100%): {full_range_km:.2f} km", ln=True)
-    pdf.cell(0, 8, f"Estimated usable range ({soc}%): {usable_range_km:.2f} km", ln=True)
-    pdf.ln(6)
-    pdf.cell(0, 8, "Recommendations:", ln=True)
-    for r in recs:
-        pdf.multi_cell(0, 8, f"- {r}")
-    pdf.output(filename)
-    return filename
-
-if st.button("Download PDF Report"):
-    path = create_pdf()
-    with open(path, "rb") as f:
-        st.download_button("Click to download", f, file_name="EV_range_report.pdf", mime="application/pdf")
-
-st.markdown("---")
-st.caption("Model: RandomForestRegressor trained on dataset. Results are estimates — perform field validation.")
+if __name__ == "__main__":
+    main()

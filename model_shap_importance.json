@@ -1,0 +1,38 @@
+[
+    {
+        "Feature":"num__speed_kmh",
+        "SHAP_Importance":1.4077812433
+    },
+    {
+        "Feature":"eng__e_demand",
+        "SHAP_Importance":0.1328855604
+    },
+    {
+        "Feature":"num__slope_%",
+        "SHAP_Importance":0.080762364
+    },
+    {
+        "Feature":"num__vehicle_we",
+        "SHAP_Importance":0.0541652404
+    },
+    {
+        "Feature":"num__battery_vol",
+        "SHAP_Importance":0.0444014817
+    },
+    {
+        "Feature":"cat__Road Type = 3",
+        "SHAP_Importance":0.0283756219
+    },
+    {
+        "Feature":"cat__Road Type = 1",
+        "SHAP_Importance":0.0207303502
+    },
+    {
+        "Feature":"num__weather_c",
+        "SHAP_Importance":0.0201629866
+    },
+    {
+        "Feature":"cat__Road Type = 2",
+        "SHAP_Importance":0.005521893
+    }
+]
